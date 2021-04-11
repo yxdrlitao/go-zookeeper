@@ -807,6 +807,7 @@ func (c *Conn) sendLoop() error {
 		case <-pingTicker.C:
 			n, err := encodePacket(c.buf[4:], &requestHeader{Xid: -2, Opcode: opPing})
 			if err != nil {
+				// TODO 应去除panic
 				panic("zk: opPing should never fail to serialize")
 			}
 
@@ -838,6 +839,7 @@ func (c *Conn) recvLoop(conn net.Conn) error {
 	for {
 		// package length
 		if err := conn.SetReadDeadline(time.Now().Add(c.recvTimeout)); err != nil {
+			// TODO 是否需要跳过
 			c.logger.Printf("failed to set connection deadline: %v", err)
 		}
 		_, err := io.ReadFull(conn, buf[:4])
@@ -895,6 +897,7 @@ func (c *Conn) recvLoop(conn net.Conn) error {
 				if watchers, ok := c.watchers[wpt]; ok {
 					for _, ch := range watchers {
 						ch <- ev
+						// TODO 不太理解为何close
 						close(ch)
 					}
 					delete(c.watchers, wpt)
