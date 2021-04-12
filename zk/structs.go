@@ -3,6 +3,7 @@ package zk
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"log"
 	"reflect"
 	"runtime"
@@ -408,7 +409,7 @@ func decodePacket(buf []byte, st interface{}) (n int, err error) {
 			if e, ok := r.(runtime.Error); ok && strings.HasPrefix(e.Error(), "runtime error: slice bounds out of range") {
 				err = ErrShortBuffer
 			} else {
-				panic(r)
+				err = fmt.Errorf("runtime error: %v", r)
 			}
 		}
 	}()
@@ -499,7 +500,7 @@ func encodePacket(buf []byte, st interface{}) (n int, err error) {
 			if e, ok := r.(runtime.Error); ok && strings.HasPrefix(e.Error(), "runtime error: slice bounds out of range") {
 				err = ErrShortBuffer
 			} else {
-				panic(r)
+				err = fmt.Errorf("runtime error: %v", r)
 			}
 		}
 	}()

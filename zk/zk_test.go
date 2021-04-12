@@ -132,7 +132,6 @@ func TestIncrementalReconfig(t *testing.T) {
 		Servers:    []ServerConfigServer{testSrvConfig},
 	}
 
-	// TODO: clean all this server creating up to a better helper method
 	cfgPath := filepath.Join(srvPath, _testConfigName)
 	fi, err := os.Create(cfgPath)
 	requireNoError(t, err)
@@ -297,7 +296,10 @@ func TestIfAuthdataSurvivesReconnect(t *testing.T) {
 	}
 	defer zk.Close()
 
-	acl := DigestACL(PermAll, "userfoo", "passbar")
+	acl, err := DigestACL(PermAll, "userfoo", "passbar")
+	if err != nil {
+		t.Fatalf("DigestACL: %v", err)
+	}
 
 	_, err = zk.Create(testNode, []byte("Some very secret content"), 0, acl)
 	if err != nil && err != ErrNodeExists {
@@ -451,7 +453,10 @@ func TestAuth(t *testing.T) {
 		t.Fatalf("Delete returned error: %+v", err)
 	}
 
-	acl := DigestACL(PermAll, "user", "password")
+	acl, err := DigestACL(PermAll, "user", "password")
+	if err != nil {
+		t.Fatalf("DigestACL: %+v", err)
+	}
 
 	if p, err := zk.Create(path, []byte{1, 2, 3, 4}, 0, acl); err != nil {
 		t.Fatalf("Create returned error: %+v", err)

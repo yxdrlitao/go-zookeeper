@@ -24,14 +24,14 @@ func WorldACL(perms int32) []ACL {
 	return []ACL{{perms, "world", "anyone"}}
 }
 
-func DigestACL(perms int32, user, password string) []ACL {
+func DigestACL(perms int32, user, password string) ([]ACL, error) {
 	userPass := []byte(fmt.Sprintf("%s:%s", user, password))
 	h := sha1.New()
 	if n, err := h.Write(userPass); err != nil || n != len(userPass) {
-		panic("SHA1 failed")
+		return nil, fmt.Errorf("SHA1 failed: %v", err)
 	}
 	digest := base64.StdEncoding.EncodeToString(h.Sum(nil))
-	return []ACL{{perms, "digest", fmt.Sprintf("%s:%s", user, digest)}}
+	return []ACL{{perms, "digest", fmt.Sprintf("%s:%s", user, digest)}}, nil
 }
 
 // FormatServers takes a slice of addresses, and makes sure they are in a format

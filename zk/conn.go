@@ -2,8 +2,7 @@
 package zk
 
 /*
-TODO:
-* make sure a ping response comes back in a reasonable time
+make sure a ping response comes back in a reasonable time
 
 Possible watcher events:
 * Event{Type: EventNotWatching, State: StateDisconnected, Path: path, Err: err}
@@ -82,6 +81,7 @@ type Conn struct {
 	eventChan      chan Event
 	eventCallback  EventCallback // may be nil
 	shouldQuit     chan struct{}
+	shouldQuitOnce sync.Once
 	pingInterval   time.Duration
 	recvTimeout    time.Duration
 	connectTimeout time.Duration
@@ -178,7 +178,6 @@ func Connect(servers []string, sessionTimeout time.Duration, options ...connOpti
 	}
 
 	srvs := make([]string, len(servers))
-
 	for i, addr := range servers {
 		if strings.Contains(addr, ":") {
 			srvs[i] = addr
@@ -310,12 +309,14 @@ func WithMaxConnBufferSize(maxBufferSize int) connOption {
 }
 
 func (c *Conn) Close() {
-	close(c.shouldQuit)
+	c.shouldQuitOnce.Do(func() {
+		close(c.shouldQuit)
 
-	select {
-	case <-c.queueRequest(opClose, &closeRequest{}, &closeResponse{}, nil):
-	case <-time.After(time.Second):
-	}
+		select {
+		case <-c.queueRequest(opClose, &closeRequest{}, &closeResponse{}, nil):
+		case <-time.After(time.Second):
+		}
+	})
 }
 
 // State returns the current state of the connection.
@@ -354,7 +355,7 @@ func (c *Conn) sendEvent(evt Event) {
 	select {
 	case c.eventChan <- evt:
 	default:
-		// panic("zk: event channel full - it must be monitored and never allowed to be full")
+		c.logger.Printf("WARN: event channel full - it must be monitored and never allowed to be full")
 	}
 }
 
@@ -391,7 +392,7 @@ func (c *Conn) connect() error {
 	}
 }
 
-func (c *Conn) resendZkAuth(reauthReadyChan chan struct{}) {
+func (c *Conn) resendZkAuth() error {
 	shouldCancel := func() bool {
 		select {
 		case <-c.shouldQuit:
@@ -406,15 +407,13 @@ func (c *Conn) resendZkAuth(reauthReadyChan chan struct{}) {
 	c.credsMu.Lock()
 	defer c.credsMu.Unlock()
 
-	defer close(reauthReadyChan)
-
 	if c.logInfo {
 		c.logger.Printf("re-submitting `%d` credentials after reconnect", len(c.creds))
 	}
 
 	for _, cred := range c.creds {
 		if shouldCancel() {
-			return
+			return nil
 		}
 		resChan, err := c.sendRequest(
 			opSetAuth,
@@ -426,9 +425,7 @@ func (c *Conn) resendZkAuth(reauthReadyChan chan struct{}) {
 			nil)
 
 		if err != nil {
-			c.logger.Printf("call to sendRequest failed during credential resubmit: %s", err)
-			// FIXME(prozlach): lets ignore errors for now
-			continue
+			return fmt.Errorf("failed to send auth request: %v", err)
 		}
 
 		var res response
@@ -436,17 +433,16 @@ func (c *Conn) resendZkAuth(reauthReadyChan chan struct{}) {
 		case res = <-resChan:
 		case <-c.closeChan:
 			c.logger.Printf("recv closed, cancel re-submitting credentials")
-			return
+			return nil
 		case <-c.shouldQuit:
 			c.logger.Printf("should quit, cancel re-submitting credentials")
-			return
+			return nil
 		}
 		if res.err != nil {
-			c.logger.Printf("credential re-submit failed: %s", res.err)
-			// FIXME(prozlach): lets ignore errors for now
-			continue
+			return fmt.Errorf("failed conneciton setAuth request: %v", res.err)
 		}
 	}
+	return nil
 }
 
 func (c *Conn) sendRequest(
@@ -495,25 +491,28 @@ func (c *Conn) loop() {
 			}
 			c.hostProvider.Connected()        // mark success
 			c.closeChan = make(chan struct{}) // channel to tell send loop stop
-			reauthChan := make(chan struct{}) // channel to tell send loop that authdata has been resubmitted
 
 			var wg sync.WaitGroup
 			wg.Add(1)
 			go func() {
-				<-reauthChan
-				if c.debugCloseRecvLoop {
-					close(c.debugReauthDone)
+				defer c.conn.Close() // causes recv loop to EOF/exit
+				defer wg.Done()
+
+				if err := c.resendZkAuth(); err != nil {
+					c.logger.Printf("error in resending auth creds: %v", err)
+					return
 				}
-				err := c.sendLoop()
-				if err != nil || c.logInfo {
-					c.logger.Printf("send loop terminated: err=%v", err)
+
+				if err := c.sendLoop(); err != nil || c.logInfo {
+					c.logger.Printf("send loop terminated: %v", err)
 				}
-				c.conn.Close() // causes recv loop to EOF/exit
-				wg.Done()
 			}()
 
 			wg.Add(1)
 			go func() {
+				defer close(c.closeChan) // tell send loop to exit
+				defer wg.Done()
+
 				var err error
 				if c.debugCloseRecvLoop {
 					err = errors.New("DEBUG: close recv loop")
@@ -524,13 +523,10 @@ func (c *Conn) loop() {
 					c.logger.Printf("recv loop terminated: err=%v", err)
 				}
 				if err == nil {
-					panic("zk: recvLoop should never return nil error")
+					c.logger.Printf("recvLoop should never return nil error: %v", err)
+					return
 				}
-				close(c.closeChan) // tell send loop to exit
-				wg.Done()
 			}()
-
-			c.resendZkAuth(reauthChan)
 
 			c.sendSetWatches()
 			wg.Wait()
@@ -664,7 +660,6 @@ func (c *Conn) sendSetWatches() {
 
 	go func() {
 		res := &setWatchesResponse{}
-		// TODO: Pipeline these so queue all of them up before waiting on any
 		// response. That will require some investigation to make sure there
 		// aren't failure modes where a blocking write to the channel of requests
 		// could hang indefinitely and cause this goroutine to leak...
@@ -807,8 +802,7 @@ func (c *Conn) sendLoop() error {
 		case <-pingTicker.C:
 			n, err := encodePacket(c.buf[4:], &requestHeader{Xid: -2, Opcode: opPing})
 			if err != nil {
-				// TODO 应去除panic
-				panic("zk: opPing should never fail to serialize")
+				return fmt.Errorf("opPing should never fail to serialize: %v", err)
 			}
 
 			binary.BigEndian.PutUint32(c.buf[:4], uint32(n))
@@ -839,7 +833,6 @@ func (c *Conn) recvLoop(conn net.Conn) error {
 	for {
 		// package length
 		if err := conn.SetReadDeadline(time.Now().Add(c.recvTimeout)); err != nil {
-			// TODO 是否需要跳过
 			c.logger.Printf("failed to set connection deadline: %v", err)
 		}
 		_, err := io.ReadFull(conn, buf[:4])
@@ -897,7 +890,6 @@ func (c *Conn) recvLoop(conn net.Conn) error {
 				if watchers, ok := c.watchers[wpt]; ok {
 					for _, ch := range watchers {
 						ch <- ev
-						// TODO 不太理解为何close
 						close(ch)
 					}
 					delete(c.watchers, wpt)
@@ -981,7 +973,6 @@ func (c *Conn) AddAuth(scheme string, auth []byte) error {
 
 	// Remember authdata so that it can be re-submitted on reconnect
 	//
-	// FIXME(prozlach): For now we treat "userfoo:passbar" and "userfoo:passbar2"
 	// as two different entries, which will be re-submitted on reconnet. Some
 	// research is needed on how ZK treats these cases and
 	// then maybe switch to something like "map[username] = password" to allow
@@ -1245,7 +1236,6 @@ func (c *Conn) Multi(ops ...interface{}) ([]MultiResponse, error) {
 // by lists of members.
 // Return the new configuration stats.
 func (c *Conn) IncrementalReconfig(joining, leaving []string, version int64) (*Stat, error) {
-	// TODO: validate the shape of the member string to give early feedback.
 	request := &reconfigRequest{
 		JoiningServers: []byte(strings.Join(joining, ",")),
 		LeavingServers: []byte(strings.Join(leaving, ",")),

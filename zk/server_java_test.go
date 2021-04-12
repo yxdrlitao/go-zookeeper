@@ -125,7 +125,6 @@ func (sc ServerConfig) Marshall(w io.Writer) error {
 		fmt.Fprintf(w, "autopurge.purgeInterval=%d\n", sc.AutoPurgePurgeInterval)
 	}
 	// enable reconfig.
-	// TODO: allow setting this
 	fmt.Fprintln(w, "reconfigEnabled=true")
 	fmt.Fprintln(w, "4lw.commands.whitelist=*")
 
