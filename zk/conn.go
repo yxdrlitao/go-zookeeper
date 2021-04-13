@@ -355,7 +355,7 @@ func (c *Conn) sendEvent(evt Event) {
 	select {
 	case c.eventChan <- evt:
 	default:
-		c.logger.Printf("WARN: event channel full - it must be monitored and never allowed to be full")
+		c.logger.Printf("event channel full - it must be monitored and never allowed to be full")
 	}
 }
 
@@ -392,7 +392,7 @@ func (c *Conn) connect() error {
 	}
 }
 
-func (c *Conn) resendZkAuth() error {
+func (c *Conn) resendZkAuth(reauthReadyChan chan struct{}) {
 	shouldCancel := func() bool {
 		select {
 		case <-c.shouldQuit:
@@ -406,6 +406,7 @@ func (c *Conn) resendZkAuth() error {
 
 	c.credsMu.Lock()
 	defer c.credsMu.Unlock()
+	defer close(reauthReadyChan)
 
 	if c.logInfo {
 		c.logger.Printf("re-submitting `%d` credentials after reconnect", len(c.creds))
@@ -413,7 +414,8 @@ func (c *Conn) resendZkAuth() error {
 
 	for _, cred := range c.creds {
 		if shouldCancel() {
-			return nil
+			c.logger.Printf("cancel rer-submitting credentials")
+			return
 		}
 		resChan, err := c.sendRequest(
 			opSetAuth,
@@ -425,7 +427,8 @@ func (c *Conn) resendZkAuth() error {
 			nil)
 
 		if err != nil {
-			return fmt.Errorf("failed to send auth request: %v", err)
+			c.logger.Printf("call to sendRequest failed during credential resubmit: %s", err)
+			continue
 		}
 
 		var res response
@@ -433,16 +436,16 @@ func (c *Conn) resendZkAuth() error {
 		case res = <-resChan:
 		case <-c.closeChan:
 			c.logger.Printf("recv closed, cancel re-submitting credentials")
-			return nil
+			return
 		case <-c.shouldQuit:
 			c.logger.Printf("should quit, cancel re-submitting credentials")
-			return nil
+			return
 		}
 		if res.err != nil {
-			return fmt.Errorf("failed conneciton setAuth request: %v", res.err)
+			c.logger.Printf("credential re-submit failed: %s", res.err)
+			continue
 		}
 	}
-	return nil
 }
 
 func (c *Conn) sendRequest(
@@ -491,6 +494,7 @@ func (c *Conn) loop() {
 			}
 			c.hostProvider.Connected()        // mark success
 			c.closeChan = make(chan struct{}) // channel to tell send loop stop
+			reauthChan := make(chan struct{}) // channel to tell send loop that authdata has been resubmitted
 
 			var wg sync.WaitGroup
 			wg.Add(1)
@@ -498,9 +502,9 @@ func (c *Conn) loop() {
 				defer c.conn.Close() // causes recv loop to EOF/exit
 				defer wg.Done()
 
-				if err := c.resendZkAuth(); err != nil {
-					c.logger.Printf("error in resending auth creds: %v", err)
-					return
+				<-reauthChan
+				if c.debugCloseRecvLoop {
+					close(c.debugReauthDone)
 				}
 
 				if err := c.sendLoop(); err != nil || c.logInfo {
@@ -520,7 +524,7 @@ func (c *Conn) loop() {
 					err = c.recvLoop(c.conn)
 				}
 				if err != io.EOF || c.logInfo {
-					c.logger.Printf("recv loop terminated: err=%v", err)
+					c.logger.Printf("recv loop terminated: %v", err)
 				}
 				if err == nil {
 					c.logger.Printf("recvLoop should never return nil error: %v", err)
@@ -528,6 +532,7 @@ func (c *Conn) loop() {
 				}
 			}()
 
+			c.resendZkAuth(reauthChan)
 			c.sendSetWatches()
 			wg.Wait()
 		}
